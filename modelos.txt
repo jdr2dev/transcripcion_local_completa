@@ -1,0 +1,11 @@
+huggingface-cli download guillaumekln/faster-whisper-small --local-dir models/whisper-small --local-dir-use-symlinks False
+huggingface-cli download guillaumekln/faster-whisper-small --local-dir models/whisper-small --local-dir-use-symlinks False
+huggingface-cli download guillaumekln/faster-whisper-small --local-dir models/whisper-small --local-dir-use-symlinks False
+# (solo si el repo es gated) inicia sesión
+huggingface-cli login    # pega tu token de HF
+
+# descarga completa sin symlinks
+huggingface-cli download finiteautomata/beto-sentiment-analysis --local-dir models/sentiment --local-dir-use-symlinks False
+
+
+
