@@ -1,0 +1,9 @@
+README.md
+pyproject.toml
+app/__init__.py
+app/main.py
+transcripcion_local.egg-info/PKG-INFO
+transcripcion_local.egg-info/SOURCES.txt
+transcripcion_local.egg-info/dependency_links.txt
+transcripcion_local.egg-info/requires.txt
+transcripcion_local.egg-info/top_level.txt

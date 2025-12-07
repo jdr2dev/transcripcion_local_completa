@@ -1,0 +1,13 @@
+### Enviar audio y crear job
+POST http://localhost:8000/jobs
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="file"; filename="audio.wav"
+Content-Type: audio/wav
+
+< /ruta/a/tu/audio.wav
+--boundary--
+
+### Consultar estado (reemplaza JOB_ID)
+GET http://localhost:8000/jobs/JOB_ID

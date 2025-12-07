@@ -1,0 +1,31 @@
+[project]
+name = "transcripcion-local"
+version = "0.1.0"
+description = "Servicio local de transcripción, diarización y análisis de sentimiento."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.24.0",
+    "pydantic>=2.6.0",
+    "faster-whisper>=0.10.0",
+    "pyannote.audio>=3.1.1",
+    "torch>=2.1.0",
+    "transformers>=4.35.0",
+    "soundfile>=0.12.1",
+    "numpy>=1.25.0",
+    "scipy>=1.11.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "python-dotenv>=1.0.0",
+    "httpx>=0.25.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["app"]
