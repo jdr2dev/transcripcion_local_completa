@@ -47,6 +47,7 @@ export HF_HUB_OFFLINE=1  # evita descargas
 export TRANSCRIPTION_MODEL_PATH=models/whisper-small
 export DIARIZATION_MODEL_PATH=models/diarization
 export SENTIMENT_MODEL_PATH=models/sentiment
+export NUM_SPEAKERS=2  # asume llamadas de dos interlocutores
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -61,7 +62,7 @@ Los resultados se guardan en `data/results/{job_id}.json`. Los audios se almacen
 
 - Todo el pipeline se ejecuta en local.
 - Se usa una cola basada en SQLite y un worker en segundo plano que procesa los trabajos secuencialmente.
-- El JSON de salida incluye por segmento: texto, speaker, inicio, fin, etiqueta y puntuación de sentimiento.
+- El JSON de salida incluye: `full_transcript` con la transcripción completa y, por segmento, texto, speaker, inicio, fin, etiqueta y puntuación de sentimiento. El diarizador se limita a los `NUM_SPEAKERS` más largos (por defecto 2).
 
 ## Desarrollo rápido
 

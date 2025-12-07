@@ -56,11 +56,16 @@ class SegmentOutput(BaseModel):
     sentiment_score: float
 
 
+class JobResult(BaseModel):
+    full_transcript: str
+    segments: List[SegmentOutput]
+
+
 class JobResponse(BaseModel):
     id: str
     status: str
     error: Optional[str] = None
-    result: Optional[List[SegmentOutput]] = None
+    result: Optional[JobResult] = None
 
 
 def ensure_paths() -> None:
@@ -99,6 +104,7 @@ class AudioProcessor:
         )
         self.diarization_model_path = os.getenv("DIARIZATION_MODEL_PATH", "models/diarization")
         self.sentiment_model_path = os.getenv("SENTIMENT_MODEL_PATH", "models/sentiment")
+        self.target_speakers = int(os.getenv("NUM_SPEAKERS", "2"))
         self.whisper_model: Optional[WhisperModel] = None
         self.diarization_pipeline: Optional[Pipeline] = None
         self.sentiment_pipeline = None
@@ -162,16 +168,90 @@ class AudioProcessor:
 
     def diarize(self, audio_path: Path) -> List[DiarizationSegment]:
         pipeline = self.load_diarizer()
-        diarization = pipeline(str(audio_path))
+        try:
+            diarization = pipeline(str(audio_path), num_speakers=self.target_speakers)
+        except TypeError:
+            diarization = pipeline(str(audio_path))
         diar_segments: List[DiarizationSegment] = []
-        for segment, _, speaker in diarization.itertracks(yield_label=True):
+
+        def _append(seg_obj) -> None:
+            start = float(getattr(seg_obj, "start", 0.0))
+            end = float(getattr(seg_obj, "end", 0.0))
+            speaker_val = (
+                getattr(seg_obj, "speaker", None)
+                or getattr(seg_obj, "label", None)
+                or (seg_obj.get("speaker") if isinstance(seg_obj, dict) else None)
+                or (seg_obj.get("label") if isinstance(seg_obj, dict) else None)
+                or "unknown"
+            )
             diar_segments.append(
                 DiarizationSegment(
-                    start=float(segment.start),
-                    end=float(segment.end),
-                    speaker=str(speaker),
+                    start=start,
+                    end=end,
+                    speaker=str(speaker_val),
                 )
             )
+
+        if hasattr(diarization, "itertracks"):  # clásico Annotation
+            for segment, _, speaker in diarization.itertracks(yield_label=True):
+                diar_segments.append(
+                    DiarizationSegment(
+                        start=float(segment.start),
+                        end=float(segment.end),
+                        speaker=str(speaker),
+                        )
+                    )
+        elif hasattr(diarization, "speaker_diarization"):  # pyannote 3.x DiarizeOutput
+            annotation = getattr(diarization, "exclusive_speaker_diarization", None) or diarization.speaker_diarization
+            if hasattr(annotation, "itertracks"):
+                for segment, _, speaker in annotation.itertracks(yield_label=True):
+                    diar_segments.append(
+                        DiarizationSegment(
+                            start=float(segment.start),
+                            end=float(segment.end),
+                            speaker=str(speaker),
+                        )
+                    )
+            elif hasattr(diarization, "serialize"):
+                serialized = diarization.serialize().get("exclusive_diarization") or diarization.serialize().get("diarization", [])
+                for seg in serialized:
+                    _append(seg)
+            else:
+                raise RuntimeError(f"Formato de diarización no soportado: {type(annotation)}")
+        elif hasattr(diarization, "to_annotation"):  # DiarizeOutput -> Annotation
+            annotation = diarization.to_annotation()
+            if hasattr(annotation, "itertracks"):
+                for segment, _, speaker in annotation.itertracks(yield_label=True):
+                    diar_segments.append(
+                        DiarizationSegment(
+                            start=float(segment.start),
+                            end=float(segment.end),
+                            speaker=str(speaker),
+                        )
+                    )
+            else:
+                raise RuntimeError(f"Formato de diarización no soportado: {type(annotation)}")
+        elif hasattr(diarization, "segments"):  # DiarizeOutput u objeto similar
+            for seg in diarization.segments:
+                _append(seg)
+        elif isinstance(diarization, (list, tuple)):  # lista de dicts
+            for seg in diarization:
+                _append(seg)
+        elif hasattr(diarization, "__iter__"):  # fallback genérico iterable
+            for seg in diarization:
+                _append(seg)
+        else:
+            raise RuntimeError(f"Formato de diarización no soportado: {type(diarization)}")
+
+        # Limita a los speakers más largos (útil en llamadas a 2 interlocutores).
+        if self.target_speakers and len(diar_segments) > 0:
+            durations: dict[str, float] = {}
+            for seg in diar_segments:
+                durations[seg.speaker] = durations.get(seg.speaker, 0.0) + (seg.end - seg.start)
+            top_speakers = sorted(durations.items(), key=lambda x: x[1], reverse=True)[: self.target_speakers]
+            allowed = {spk for spk, _ in top_speakers}
+            diar_segments = [seg for seg in diar_segments if seg.speaker in allowed]
+
         return diar_segments
 
     def analyze_sentiment(self, text: str) -> tuple[str, float]:
@@ -195,8 +275,9 @@ class AudioProcessor:
                 best_speaker = diar.speaker
         return best_speaker
 
-    def process(self, audio_path: Path) -> List[SegmentOutput]:
+    def process(self, audio_path: Path) -> tuple[str, List[SegmentOutput]]:
         transcription_segments = self.transcribe(audio_path)
+        full_transcript = " ".join(seg.text for seg in transcription_segments).strip()
         diarization_segments = self.diarize(audio_path)
         result_segments: List[SegmentOutput] = []
         for t_segment in transcription_segments:
@@ -212,7 +293,7 @@ class AudioProcessor:
                     sentiment_score=sentiment_score,
                 )
             )
-        return result_segments
+        return full_transcript, result_segments
 
 
 class JobQueueWorker:
@@ -264,13 +345,14 @@ class JobQueueWorker:
         audio_path = Path(job_row["filename"])
         self.update_status(conn, job_id, JobStatus.PROCESSING)
         try:
-            segments = self.processor.process(audio_path)
+            full_transcript, segments = self.processor.process(audio_path)
             result_path = RESULTS_DIR / f"{job_id}.json"
             with result_path.open("w", encoding="utf-8") as f:
                 json.dump(
                     {
                         "job_id": job_id,
                         "source": str(audio_path),
+                        "full_transcript": full_transcript,
                         "segments": [s.model_dump() for s in segments],
                     },
                     f,
@@ -352,5 +434,7 @@ async def get_job(job_id: str, conn=Depends(get_connection)) -> JobResponse:
         if result_file.exists():
             with result_file.open("r", encoding="utf-8") as f:
                 payload = json.load(f)
-                result = [SegmentOutput(**segment) for segment in payload.get("segments", [])]
+                segments = [SegmentOutput(**segment) for segment in payload.get("segments", [])]
+                full_transcript = payload.get("full_transcript", "")
+                result = JobResult(full_transcript=full_transcript, segments=segments)
     return JobResponse(id=row["id"], status=status, error=error, result=result)

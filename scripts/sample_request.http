@@ -6,7 +6,7 @@ Content-Type: multipart/form-data; boundary=boundary
 Content-Disposition: form-data; name="file"; filename="audio.wav"
 Content-Type: audio/wav
 
-< /ruta/a/tu/audio.wav
+< audio.wav
 --boundary--
 
 ### Consultar estado (reemplaza JOB_ID)
