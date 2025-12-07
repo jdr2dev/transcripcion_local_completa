@@ -10,4 +10,5 @@ Content-Type: audio/wav
 --boundary--
 
 ### Consultar estado (reemplaza JOB_ID)
-GET http://localhost:8000/jobs/JOB_ID
+GET http://localhost:8000/jobs/a911a070-c898-44f0-ad18-9b24de92223d
+
