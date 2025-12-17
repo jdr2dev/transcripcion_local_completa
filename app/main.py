@@ -3,28 +3,35 @@ import os
 import sqlite3
 import time
 import uuid
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Thread
 from typing import List, Optional
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
-# Model imports are intentionally lazy-loaded inside AudioProcessor to avoid heavy startup.
 from faster_whisper import WhisperModel  # type: ignore
-from pyannote.audio import Pipeline  # type: ignore
 from transformers import pipeline as hf_pipeline  # type: ignore
+import soundfile as sf
 
+
+# ========================
+# Paths / Config
+# ========================
 
 DATA_DIR = Path("data")
 UPLOADS_DIR = DATA_DIR / "uploads"
 RESULTS_DIR = DATA_DIR / "results"
 DB_PATH = DATA_DIR / "jobs.db"
 
-# Evita llamadas a la red de HuggingFace en entornos sin Internet.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
+
+# ========================
+# Models
+# ========================
 
 class JobStatus:
     QUEUED = "queued"
@@ -38,13 +45,6 @@ class TranscriptionSegment:
     start: float
     end: float
     text: str
-
-
-@dataclass
-class DiarizationSegment:
-    start: float
-    end: float
-    speaker: str
 
 
 class SegmentOutput(BaseModel):
@@ -68,15 +68,18 @@ class JobResponse(BaseModel):
     result: Optional[JobResult] = None
 
 
+# ========================
+# Utils
+# ========================
+
 def ensure_paths() -> None:
-    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(exist_ok=True)
+    UPLOADS_DIR.mkdir(exist_ok=True)
+    RESULTS_DIR.mkdir(exist_ok=True)
 
 
 def get_db() -> sqlite3.Connection:
     ensure_paths()
-    # check_same_thread=False because the worker and request handlers run in different threads.
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute(
@@ -95,346 +98,287 @@ def get_db() -> sqlite3.Connection:
     return conn
 
 
+# ========================
+# Audio preprocessing
+# ========================
+
+def normalize_audio(input_path: Path) -> Path:
+    """
+    Normaliza audio VoIP:
+    - mono
+    - 16kHz
+    - PCM
+    - corrige drift RTP
+    """
+    out = input_path.with_suffix(".16k.wav")
+
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i", str(input_path),
+            "-ac", "1",
+            "-ar", "16000",
+            "-acodec", "pcm_s16le",
+            "-af", "aresample=async=1:first_pts=0",
+            str(out),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return out
+
+
+def split_stereo(input_path: Path) -> tuple[Path, Path]:
+    """
+    Split estéreo robusto para Asterisk usando filtros pan
+    (NO map_channel)
+    """
+    left = input_path.with_suffix(".ch0.wav")
+    right = input_path.with_suffix(".ch1.wav")
+
+    # Canal izquierdo
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i", str(input_path),
+            "-af", "pan=mono|c0=FL",
+            left,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # Canal derecho
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i", str(input_path),
+            "-af", "pan=mono|c0=FR",
+            right,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    return left, right
+
+
+# ========================
+# Audio Processor
+# ========================
+
 class AudioProcessor:
     def __init__(self) -> None:
         self.device = os.getenv("DEVICE", "cpu")
         self.compute_type = os.getenv("COMPUTE_TYPE", "int8")
-        self.transcription_model_path = os.getenv(
-            "TRANSCRIPTION_MODEL_PATH", os.getenv("TRANSCRIPTION_MODEL_SIZE", "models/whisper-small")
-        )
-        self.diarization_model_path = os.getenv("DIARIZATION_MODEL_PATH", "models/diarization")
+        self.model_path = os.getenv("TRANSCRIPTION_MODEL_PATH", "models/whisper-medium")
         self.sentiment_model_path = os.getenv("SENTIMENT_MODEL_PATH", "models/sentiment")
-        self.target_speakers = int(os.getenv("NUM_SPEAKERS", "2"))
-        self.whisper_model: Optional[WhisperModel] = None
-        self.diarization_pipeline: Optional[Pipeline] = None
-        self.sentiment_pipeline = None
-        self._validate_local_paths()
 
-    def _require_local(self, path_str: str, env_keys: list[str]) -> Path:
-        path = Path(path_str)
-        if not path.exists():
-            hint = " o ".join(env_keys)
-            raise RuntimeError(
-                f"Modelo no encontrado en ruta local '{path}'. "
-                f"Configura {hint} apuntando a un modelo descargado en disco."
-            )
-        return path
+        self.whisper: Optional[WhisperModel] = None
+        self.sentiment = None
 
-    def _validate_local_paths(self) -> None:
-        self._require_local(self.transcription_model_path, ["TRANSCRIPTION_MODEL_PATH", "TRANSCRIPTION_MODEL_SIZE"])
-        self._require_local(self.diarization_model_path, ["DIARIZATION_MODEL_PATH"])
-        self._require_local(self.sentiment_model_path, ["SENTIMENT_MODEL_PATH"])
-
-    def load_transcriber(self) -> WhisperModel:
-        if self.whisper_model is None:
-            self.whisper_model = WhisperModel(
-                self.transcription_model_path,
+    def load_whisper(self) -> WhisperModel:
+        if self.whisper is None:
+            self.whisper = WhisperModel(
+                self.model_path,
                 device=self.device,
                 compute_type=self.compute_type,
             )
-        return self.whisper_model
-
-    def load_diarizer(self) -> Pipeline:
-        if self.diarization_pipeline is None:
-            self.diarization_pipeline = Pipeline.from_pretrained(self.diarization_model_path)
-        return self.diarization_pipeline
+        return self.whisper
 
     def load_sentiment(self):
-        if self.sentiment_pipeline is None:
-            self.sentiment_pipeline = hf_pipeline(
+        if self.sentiment is None:
+            self.sentiment = hf_pipeline(
                 "sentiment-analysis",
                 model=self.sentiment_model_path,
                 device=0 if self.device.startswith("cuda") else -1,
             )
-        return self.sentiment_pipeline
+        return self.sentiment
 
     def transcribe(self, audio_path: Path) -> List[TranscriptionSegment]:
-        model = self.load_transcriber()
-        segments_iter, _ = model.transcribe(
+        model = self.load_whisper()
+        segments, _ = model.transcribe(
             str(audio_path),
             vad_filter=True,
             word_timestamps=False,
         )
-        segments: List[TranscriptionSegment] = []
-        for segment in segments_iter:
-            segments.append(
-                TranscriptionSegment(
-                    start=float(segment.start),
-                    end=float(segment.end),
-                    text=segment.text.strip(),
-                )
+        return [
+            TranscriptionSegment(
+                start=float(s.start),
+                end=float(s.end),
+                text=s.text.strip(),
             )
-        return segments
-
-    def diarize(self, audio_path: Path) -> List[DiarizationSegment]:
-        pipeline = self.load_diarizer()
-        try:
-            diarization = pipeline(str(audio_path), num_speakers=self.target_speakers)
-        except TypeError:
-            diarization = pipeline(str(audio_path))
-        diar_segments: List[DiarizationSegment] = []
-
-        def _append(seg_obj) -> None:
-            start = float(getattr(seg_obj, "start", 0.0))
-            end = float(getattr(seg_obj, "end", 0.0))
-            speaker_val = (
-                getattr(seg_obj, "speaker", None)
-                or getattr(seg_obj, "label", None)
-                or (seg_obj.get("speaker") if isinstance(seg_obj, dict) else None)
-                or (seg_obj.get("label") if isinstance(seg_obj, dict) else None)
-                or "unknown"
-            )
-            diar_segments.append(
-                DiarizationSegment(
-                    start=start,
-                    end=end,
-                    speaker=str(speaker_val),
-                )
-            )
-
-        if hasattr(diarization, "itertracks"):  # clásico Annotation
-            for segment, _, speaker in diarization.itertracks(yield_label=True):
-                diar_segments.append(
-                    DiarizationSegment(
-                        start=float(segment.start),
-                        end=float(segment.end),
-                        speaker=str(speaker),
-                        )
-                    )
-        elif hasattr(diarization, "speaker_diarization"):  # pyannote 3.x DiarizeOutput
-            annotation = getattr(diarization, "exclusive_speaker_diarization", None) or diarization.speaker_diarization
-            if hasattr(annotation, "itertracks"):
-                for segment, _, speaker in annotation.itertracks(yield_label=True):
-                    diar_segments.append(
-                        DiarizationSegment(
-                            start=float(segment.start),
-                            end=float(segment.end),
-                            speaker=str(speaker),
-                        )
-                    )
-            elif hasattr(diarization, "serialize"):
-                serialized = diarization.serialize().get("exclusive_diarization") or diarization.serialize().get("diarization", [])
-                for seg in serialized:
-                    _append(seg)
-            else:
-                raise RuntimeError(f"Formato de diarización no soportado: {type(annotation)}")
-        elif hasattr(diarization, "to_annotation"):  # DiarizeOutput -> Annotation
-            annotation = diarization.to_annotation()
-            if hasattr(annotation, "itertracks"):
-                for segment, _, speaker in annotation.itertracks(yield_label=True):
-                    diar_segments.append(
-                        DiarizationSegment(
-                            start=float(segment.start),
-                            end=float(segment.end),
-                            speaker=str(speaker),
-                        )
-                    )
-            else:
-                raise RuntimeError(f"Formato de diarización no soportado: {type(annotation)}")
-        elif hasattr(diarization, "segments"):  # DiarizeOutput u objeto similar
-            for seg in diarization.segments:
-                _append(seg)
-        elif isinstance(diarization, (list, tuple)):  # lista de dicts
-            for seg in diarization:
-                _append(seg)
-        elif hasattr(diarization, "__iter__"):  # fallback genérico iterable
-            for seg in diarization:
-                _append(seg)
-        else:
-            raise RuntimeError(f"Formato de diarización no soportado: {type(diarization)}")
-
-        # Limita a los speakers más largos (útil en llamadas a 2 interlocutores).
-        if self.target_speakers and len(diar_segments) > 0:
-            durations: dict[str, float] = {}
-            for seg in diar_segments:
-                durations[seg.speaker] = durations.get(seg.speaker, 0.0) + (seg.end - seg.start)
-            top_speakers = sorted(durations.items(), key=lambda x: x[1], reverse=True)[: self.target_speakers]
-            allowed = {spk for spk, _ in top_speakers}
-            diar_segments = [seg for seg in diar_segments if seg.speaker in allowed]
-
-        return diar_segments
+            for s in segments
+        ]
 
     def analyze_sentiment(self, text: str) -> tuple[str, float]:
-        sentiment_pipe = self.load_sentiment()
-        res = sentiment_pipe(text, truncation=True)[0]
-        label = res["label"].lower()
-        score = float(res["score"])
-        return label, score
-
-    @staticmethod
-    def _overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
-        return max(0.0, min(a_end, b_end) - max(a_start, b_start))
-
-    def _assign_speaker(self, segment: TranscriptionSegment, diar_segments: List[DiarizationSegment]) -> str:
-        best_speaker = "unknown"
-        best_overlap = 0.0
-        for diar in diar_segments:
-            overlap = self._overlap(segment.start, segment.end, diar.start, diar.end)
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_speaker = diar.speaker
-        return best_speaker
+        pipe = self.load_sentiment()
+        res = pipe(text, truncation=True)[0]
+        return res["label"].lower(), float(res["score"])
 
     def process(self, audio_path: Path) -> tuple[str, List[SegmentOutput]]:
-        transcription_segments = self.transcribe(audio_path)
-        full_transcript = " ".join(seg.text for seg in transcription_segments).strip()
-        diarization_segments = self.diarize(audio_path)
-        result_segments: List[SegmentOutput] = []
-        for t_segment in transcription_segments:
-            speaker = self._assign_speaker(t_segment, diarization_segments)
-            sentiment_label, sentiment_score = self.analyze_sentiment(t_segment.text)
-            result_segments.append(
-                SegmentOutput(
-                    text=t_segment.text,
-                    speaker=speaker,
-                    start=t_segment.start,
-                    end=t_segment.end,
-                    sentiment=sentiment_label,
-                    sentiment_score=sentiment_score,
-                )
-            )
-        return full_transcript, result_segments
+        with sf.SoundFile(audio_path) as f:
+            channels = f.channels
 
+        results: List[SegmentOutput] = []
+
+        if channels >= 2:
+            ch0, ch1 = split_stereo(audio_path)
+            ch0 = normalize_audio(ch0)
+            ch1 = normalize_audio(ch1)
+
+            for speaker, ch in [("agent", ch0), ("customer", ch1)]:
+                for seg in self.transcribe(ch):
+                    sentiment, score = self.analyze_sentiment(seg.text)
+                    results.append(
+                        SegmentOutput(
+                            text=seg.text,
+                            speaker=speaker,
+                            start=seg.start,
+                            end=seg.end,
+                            sentiment=sentiment,
+                            sentiment_score=score,
+                        )
+                    )
+        else:
+            mono = normalize_audio(audio_path)
+            for seg in self.transcribe(mono):
+                sentiment, score = self.analyze_sentiment(seg.text)
+                results.append(
+                    SegmentOutput(
+                        text=seg.text,
+                        speaker="unknown",
+                        start=seg.start,
+                        end=seg.end,
+                        sentiment=sentiment,
+                        sentiment_score=score,
+                    )
+                )
+
+        results.sort(key=lambda s: s.start)
+        full_transcript = " ".join(r.text for r in results)
+        return full_transcript, results
+
+
+# ========================
+# Worker
+# ========================
 
 class JobQueueWorker:
-    def __init__(self, processor: AudioProcessor, poll_interval: float = 2.0) -> None:
+    def __init__(self, processor: AudioProcessor) -> None:
         self.processor = processor
-        self.poll_interval = poll_interval
         self.stop_event = Event()
         self.thread: Optional[Thread] = None
 
     def start(self) -> None:
-        if self.thread and self.thread.is_alive():
-            return
         self.thread = Thread(target=self.run, daemon=True)
         self.thread.start()
-
-    def stop(self) -> None:
-        self.stop_event.set()
-        if self.thread:
-            self.thread.join(timeout=1)
-
-    def fetch_next_job(self, conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
-        cur = conn.execute(
-            "SELECT * FROM jobs WHERE status = ? ORDER BY created_at ASC LIMIT 1",
-            (JobStatus.QUEUED,),
-        )
-        row = cur.fetchone()
-        return row
-
-    def update_status(
-        self,
-        conn: sqlite3.Connection,
-        job_id: str,
-        status: str,
-        error_message: Optional[str] = None,
-        result_path: Optional[str] = None,
-    ) -> None:
-        conn.execute(
-            """
-            UPDATE jobs
-            SET status = ?, updated_at = ?, error_message = ?, result_path = ?
-            WHERE id = ?
-            """,
-            (status, time.strftime("%Y-%m-%d %H:%M:%S"), error_message, result_path, job_id),
-        )
-        conn.commit()
-
-    def process_job(self, conn: sqlite3.Connection, job_row: sqlite3.Row) -> None:
-        job_id = job_row["id"]
-        audio_path = Path(job_row["filename"])
-        self.update_status(conn, job_id, JobStatus.PROCESSING)
-        try:
-            full_transcript, segments = self.processor.process(audio_path)
-            result_path = RESULTS_DIR / f"{job_id}.json"
-            with result_path.open("w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "job_id": job_id,
-                        "source": str(audio_path),
-                        "full_transcript": full_transcript,
-                        "segments": [s.model_dump() for s in segments],
-                    },
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            self.update_status(conn, job_id, JobStatus.COMPLETED, result_path=str(result_path))
-        except Exception as exc:  # pylint: disable=broad-except
-            self.update_status(conn, job_id, JobStatus.FAILED, error_message=str(exc))
 
     def run(self) -> None:
         conn = get_db()
         while not self.stop_event.is_set():
-            job = self.fetch_next_job(conn)
-            if job is not None:
-                self.process_job(conn, job)
+            job = conn.execute(
+                "SELECT * FROM jobs WHERE status=? ORDER BY created_at LIMIT 1",
+                (JobStatus.QUEUED,),
+            ).fetchone()
+
+            if not job:
+                time.sleep(1)
                 continue
-            time.sleep(self.poll_interval)
+
+            try:
+                conn.execute(
+                    "UPDATE jobs SET status=? WHERE id=?",
+                    (JobStatus.PROCESSING, job["id"]),
+                )
+                conn.commit()
+
+                full, segments = self.processor.process(Path(job["filename"]))
+                out = RESULTS_DIR / f"{job['id']}.json"
+
+                with out.open("w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "job_id": job["id"],
+                            "full_transcript": full,
+                            "segments": [s.model_dump() for s in segments],
+                        },
+                        f,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+
+                conn.execute(
+                    "UPDATE jobs SET status=?, result_path=? WHERE id=?",
+                    (JobStatus.COMPLETED, str(out), job["id"]),
+                )
+                conn.commit()
+
+            except Exception as e:
+                conn.execute(
+                    "UPDATE jobs SET status=?, error_message=? WHERE id=?",
+                    (JobStatus.FAILED, str(e), job["id"]),
+                )
+                conn.commit()
 
 
-app = FastAPI(title="Transcripción local", version="0.1.0")
+# ========================
+# FastAPI
+# ========================
+
+app = FastAPI(title="Transcripción VoIP Estéreo")
 processor = AudioProcessor()
-worker = JobQueueWorker(processor=processor, poll_interval=float(os.getenv("QUEUE_POLL_INTERVAL", 2)))
-
-
-def get_connection():
-    conn = get_db()
-    try:
-        yield conn
-    finally:
-        conn.close()
+worker = JobQueueWorker(processor)
 
 
 @app.on_event("startup")
-async def startup_event() -> None:
+async def startup():
     ensure_paths()
     worker.start()
 
 
-@app.on_event("shutdown")
-async def shutdown_event() -> None:
-    worker.stop()
-
-
 @app.post("/jobs", response_model=JobResponse)
-async def create_job(file: UploadFile = File(...), conn=Depends(get_connection)) -> JobResponse:
-    ensure_paths()
-    suffix = Path(file.filename).suffix
+async def create_job(file: UploadFile = File(...), conn=Depends(get_db)):
     job_id = str(uuid.uuid4())
-    dest_path = UPLOADS_DIR / f"{job_id}{suffix}"
-    with dest_path.open("wb") as f:
-        content = await file.read()
-        f.write(content)
+    path = UPLOADS_DIR / f"{job_id}{Path(file.filename).suffix}"
+
+    with path.open("wb") as f:
+        f.write(await file.read())
 
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     conn.execute(
-        """
-        INSERT INTO jobs(id, filename, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (job_id, str(dest_path), JobStatus.QUEUED, now, now),
+        "INSERT INTO jobs VALUES (?,?,?,?,?,?,?)",
+        (job_id, str(path), JobStatus.QUEUED, now, now, None, None),
     )
     conn.commit()
+
     return JobResponse(id=job_id, status=JobStatus.QUEUED)
 
 
 @app.get("/jobs/{job_id}", response_model=JobResponse)
-async def get_job(job_id: str, conn=Depends(get_connection)) -> JobResponse:
-    cur = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
-    row = cur.fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Job not found")
+async def get_job(job_id: str, conn=Depends(get_db)):
+    row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(404)
 
-    status = row["status"]
-    error = row["error_message"]
-    result: Optional[List[SegmentOutput]] = None
-    if status == JobStatus.COMPLETED and row["result_path"]:
-        result_file = Path(row["result_path"])
-        if result_file.exists():
-            with result_file.open("r", encoding="utf-8") as f:
-                payload = json.load(f)
-                segments = [SegmentOutput(**segment) for segment in payload.get("segments", [])]
-                full_transcript = payload.get("full_transcript", "")
-                result = JobResult(full_transcript=full_transcript, segments=segments)
-    return JobResponse(id=row["id"], status=status, error=error, result=result)
+    result = None
+    if row["status"] == JobStatus.COMPLETED and row["result_path"]:
+        with open(row["result_path"], "r", encoding="utf-8") as f:
+            data = json.load(f)
+            result = JobResult(
+                full_transcript=data["full_transcript"],
+                segments=[SegmentOutput(**s) for s in data["segments"]],
+            )
+
+    return JobResponse(
+        id=row["id"],
+        status=row["status"],
+        error=row["error_message"],
+        result=result,
+    )

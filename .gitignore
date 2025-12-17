@@ -7,3 +7,5 @@ data/jobs.db
 .DS_Store
 models/
 audio.wav
+venv/
+.python-version

@@ -48,7 +48,10 @@ export TRANSCRIPTION_MODEL_PATH=models/whisper-small
 export DIARIZATION_MODEL_PATH=models/diarization
 export SENTIMENT_MODEL_PATH=models/sentiment
 export NUM_SPEAKERS=2  # asume llamadas de dos interlocutores
+
 uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+
 ```
 
 ## Endpoints principales
