@@ -1,22 +1,10 @@
-huggingface-cli download guillaumekln/faster-whisper-small --local-dir models/whisper-small --local-dir-use-symlinks False
-huggingface-cli download guillaumekln/faster-whisper-small --local-dir models/whisper-small --local-dir-use-symlinks False
-huggingface-cli download guillaumekln/faster-whisper-small --local-dir models/whisper-small --local-dir-use-symlinks False
 # (solo si el repo es gated) inicia sesión
 huggingface-cli login    # pega tu token de HF
 
 # descarga completa sin symlinks
-huggingface-cli download finiteautomata/beto-sentiment-analysis --local-dir models/sentiment --local-dir-use-symlinks False
-
-python -m huggingface_hub.snapshot_download \
-  --repo-id pyannote/speaker-diarization-3.1 \
-  --local-dir models/diarization \
-  --local-dir-use-symlinks False
-
-
-# (solo si el repo es gated) inicia sesión
-huggingface-cli login    # pega tu token de HF
-
-# descarga completa sin symlinks
-huggingface-cli download pyannote/speaker-diarization-3.1 \
-  --local-dir models/diarization \
-  --local-dir-use-symlinks False
+huggingface-cli login 
+huggingface-cli download guillaumekln/faster-whisper-small   --local-dir models/whisper-small   --local-dir-use-symlinks False
+huggingface-cli download finiteautomata/beto-sentiment-analysis   --local-dir models/sentiment   --local-dir-use-symlinks False
+huggingface-cli download guillaumekln/faster-whisper-medium   --local-dir models/whisper-medium   --local-dir-use-symlinks False
+  
+huggingface-cli download pyannote/speaker-diarization-3.1   --local-dir models/diarization   --local-dir-use-symlinks False
