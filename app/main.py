@@ -175,8 +175,8 @@ def split_stereo(input_path: Path) -> tuple[Path, Path]:
 
 class AudioProcessor:
     def __init__(self) -> None:
-        self.device = os.getenv("DEVICE", "cpu")
-        self.compute_type = os.getenv("COMPUTE_TYPE", "int8")
+        self.device = os.getenv("DEVICE", "cuda")
+        self.compute_type = os.getenv("COMPUTE_TYPE", "float16")
         self.model_path = os.getenv("TRANSCRIPTION_MODEL_PATH", "models/whisper-medium")
         self.sentiment_model_path = os.getenv("SENTIMENT_MODEL_PATH", "models/sentiment")
 
